@@ -1,79 +1,59 @@
 import { getBodyBuffer } from '@/utils/body';
 import {
   getProxyHeaders,
-  getAfterResponseHeaders,
-  getBlacklistedHeaders,
+  getBlacklistedHeaders
 } from '@/utils/headers';
-import {
-  createTokenIfNeeded,
-  isAllowedToMakeRequest,
-  setTokenHeader,
-} from '@/utils/turnstile';
 
 export default defineEventHandler(async (event) => {
-  // Handle preflight CORS requests
+  // Handle preflight CORS
   if (isPreflightRequest(event)) {
     handleCors(event, {});
-    // Ensure the response ends here for preflight
     event.node.res.statusCode = 204;
     event.node.res.end();
     return;
   }
 
-  // Reject any other OPTIONS requests
   if (event.node.req.method === 'OPTIONS') {
-    throw createError({
-      statusCode: 405,
-      statusMessage: 'Method Not Allowed',
-    });
+    throw createError({ statusCode: 405, statusMessage: 'Method Not Allowed' });
   }
 
-  // Parse destination URL
   const destination = getQuery<{ destination?: string }>(event).destination;
   if (!destination) {
-    return await sendJson({
-      event,
-      status: 200,
-      data: {
-        message: `Proxy is working as expected (v${
-          useRuntimeConfig(event).version
-        })`,
-      },
+    throw createError({
+      statusCode: 400,
+      statusMessage: 'Missing `destination` query param'
     });
   }
 
-  // Check if allowed to make the request
-  if (!(await isAllowedToMakeRequest(event))) {
-    return await sendJson({
-      event,
-      status: 401,
-      data: {
-        error: 'Invalid or missing token',
-      },
-    });
-  }
-
-  // Read body and create token if needed
   const body = await getBodyBuffer(event);
-  const token = await createTokenIfNeeded(event);
 
-  // Proxy the request
   try {
-    await specificProxyRequest(event, destination, {
-      blacklistedHeaders: getBlacklistedHeaders(),
-      fetchOptions: {
-        redirect: 'follow',
-        headers: getProxyHeaders(event.headers),
-        body,
+    const response = await $fetch.raw(destination, {
+      method: event.node.req.method,
+      headers: {
+        ...getProxyHeaders(event.headers),
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/113.0.0.0 Safari/537.36',
+        'Origin': 'https://xprime.tv',
+        'Referer': 'https://xprime.tv',
       },
-      onResponse(outputEvent, response) {
-        const headers = getAfterResponseHeaders(response.headers, response.url);
-        setResponseHeaders(outputEvent, headers);
-        if (token) setTokenHeader(event, token);
-      },
+      body,
+      redirect: 'follow',
     });
-  } catch (e) {
-    console.log('Error fetching', e);
-    throw e;
+
+    // Set response headers (excluding blacklisted ones)
+    const filteredHeaders: Record<string, string> = {};
+    for (const [key, value] of Object.entries(response.headers)) {
+      if (!getBlacklistedHeaders().includes(key.toLowerCase()) && value)
+        filteredHeaders[key] = value.toString();
+    }
+
+    setResponseHeaders(event, filteredHeaders);
+    return response._data; // return raw proxied body
+  } catch (error: any) {
+    console.error('Proxy Error:', error);
+    throw createError({
+      statusCode: error.response?.status || 500,
+      statusMessage: error.message || 'Proxy fetch failed',
+    });
   }
 });
